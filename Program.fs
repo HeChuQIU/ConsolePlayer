@@ -1,16 +1,23 @@
 ﻿open System
+open System.Collections.Concurrent
+open System.Diagnostics
 open System.Drawing
 open System.Text
+open System.Text.RegularExpressions
+open System.Threading.Tasks
 open Argu
+open NAudio.Wave
 open OpenCvSharp
 
 type CliArguments =
     | [<Mandatory>] Input of path: string
+    | Buffer of size: int
 
     interface IArgParserTemplate with
         member s.Usage =
             match s with
             | Input _ -> "Input file"
+            | Buffer _ -> "Buffer size"
 
 let errorHandler =
     ProcessExiter(
@@ -71,63 +78,92 @@ let getNewSize (originalSize: int * int) =
 
     newWidth, newHeight
 
-
-
 let resizeFrameByConsoleSize (frame: Mat, resizedFrame: Mat) =
     let newWidth, newHeight = getNewSize (frame.Width, frame.Height)
     let newSize = Size(newWidth, newHeight)
     Cv2.Resize(frame, resizedFrame, newSize)
 
-let mutable lastBufferSize = (0, 0)
-
-let rec renderVideo (capture: VideoCapture) =
-    let nextFrameTime = DateTime.Now.AddSeconds(1.0 / capture.Fps)
-    let image = new Mat()
-    let resizedImage = new Mat()
-
-    if capture.Read(image) then
-        resizeFrameByConsoleSize (image, resizedImage)
-        let mutable output = StringBuilder()
-
-        resizedImage
-        |> renderFrameToText
-        |> Array.iteri (fun i line ->
-            (if i = Console.BufferHeight - 1 || line.Length = Console.BufferWidth then
-                 output <- output.Append(line)
-             else
-                 output <- output.AppendLine(line)))
-
-        if lastBufferSize <> (Console.BufferWidth, Console.BufferHeight) then
-            Console.Clear()
-            lastBufferSize <- (Console.BufferWidth, Console.BufferHeight)
-
-        Console.SetCursorPosition(0, 0)
-        Console.Write(output.ToString())
-        Console.SetCursorPosition(0, Console.BufferHeight - 1)
-        let totalTime = TimeSpan.FromSeconds(float capture.FrameCount / capture.Fps)
-        let currentTime = TimeSpan.FromSeconds(float capture.PosFrames / capture.Fps)
-
-        Console.Write(
-            colorText (
-                Color.White,
-                $"""{currentTime.Minutes.ToString("D2")}:{currentTime.Seconds.ToString("D2")}/{totalTime.Minutes.ToString("D2")}:{totalTime.Seconds.ToString("D2")}"""
-            )
-        )
-
-        image.Dispose()
-        resizedImage.Dispose()
-        let delay = nextFrameTime - DateTime.Now
-
-        if delay > TimeSpan.Zero then
-            System.Threading.Thread.Sleep(delay)
-
-        renderVideo capture
-    else
-        0
+let GetPlayTimeText (capture: VideoCapture, delay:TimeSpan) =
+    let totalTime = TimeSpan.FromSeconds(float capture.FrameCount / capture.Fps)
+    let currentTime = TimeSpan.FromSeconds(float capture.PosFrames / capture.Fps) - delay
+    $"""{currentTime.Minutes.ToString("D2")}:{currentTime.Seconds.ToString("D2")}/{totalTime.Minutes.ToString("D2")}:{totalTime.Seconds.ToString("D2")}"""
 
 let inputPath = result.GetResult Input
-let capture = new VideoCapture(inputPath)
+let bufferSize = result.GetResult Buffer
 
-renderVideo capture |> ignore
+let main () =
+    let capture = new VideoCapture(inputPath)
+    use waveOut = new WaveOutEvent()
+    use audioReader = new AudioFileReader(inputPath)
 
-exit 0
+    if not (capture.IsOpened()) then
+        Console.WriteLine("Failed to open video file")
+        1
+    else
+        let mutable lastBufferSize = (Console.BufferWidth, Console.BufferHeight)
+        let mutable lastFrameSize = (Console.BufferWidth, Console.BufferHeight)
+        let frameBuffer =
+            new BlockingCollection<string array>(ConcurrentQueue<string array>(), bufferSize)
+
+        let image = new Mat()
+        let resizedImage = new Mat()
+
+        waveOut.Init(audioReader)
+        waveOut.Volume <- 0.5f
+
+        let mutable renderTask =
+            Task.Run(fun () ->
+                (while capture.Read(image) do
+                    resizeFrameByConsoleSize (image, resizedImage)
+                    let output = renderFrameToText resizedImage
+                    frameBuffer.Add(output)))
+
+        let printStatus (delay: TimeSpan) =
+            Console.SetCursorPosition(0, Console.BufferHeight - 1)
+            Console.Write(colorText (Color.White, GetPlayTimeText (capture, TimeSpan.FromSeconds(float frameBuffer.Count/float capture.Fps))))
+            let delayMilliseconds = int delay.TotalMilliseconds
+            let color = if delayMilliseconds > 0 then Color.Green else Color.Red
+
+            Console.Write(
+                colorText (color, $""" {delayMilliseconds.ToString(if delayMilliseconds < 0 then "D3" else "D4")}ms""")
+            )
+
+        let rec printFrame () =
+            let timeForNextFrame = DateTime.Now.Add(TimeSpan.FromSeconds(1.0 / capture.Fps))
+
+            if frameBuffer.Count = 0 && renderTask.Status = TaskStatus.RanToCompletion then
+                0
+            else
+                let frame = frameBuffer.Take()
+                if frame.Length > 0 then
+                    let currentFrameSize = (Regex.Matches(frame[0], Regex.Escape("██")).Count, frame.Length)
+                    let currentBufferSize = (Console.BufferWidth, Console.BufferHeight)
+
+                    if (lastFrameSize,lastBufferSize)<>(currentFrameSize,currentBufferSize) then
+                        lastFrameSize <- currentFrameSize
+                        lastBufferSize <- currentBufferSize
+                        Console.Clear()
+
+                    Console.SetCursorPosition(0, 0)
+                    frame |> Array.iter Console.WriteLine
+
+                let delay = timeForNextFrame - DateTime.Now
+                printStatus delay
+
+                if delay > TimeSpan.Zero then
+                    let sw = Stopwatch.StartNew()
+                    let delayMilliseconds = delay.TotalMilliseconds
+                    while sw.ElapsedMilliseconds < int delayMilliseconds do
+                        ()
+                else
+                    audioReader.CurrentTime <- TimeSpan.FromSeconds(float (capture.PosFrames - frameBuffer.Count) / capture.Fps)
+
+                printFrame ()
+
+        waveOut.Play()
+        printFrame () |> ignore
+        image.Dispose()
+        resizedImage.Dispose()
+        0
+
+exit (main ())
